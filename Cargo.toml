@@ -1,0 +1,13 @@
+[package]
+name = "gagaku_fjs_native_image"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64-simd = "0.8.0"
+crc32fast = "1.5.0"
+fjs_native_extensions = { git = "https://github.com/r52/fjs_native_extensions.git", branch = "main" }
+flate2 = { version = "1.1.8", default-features = false, features = ["zlib-rs"] }
+linkme = "0.3"
