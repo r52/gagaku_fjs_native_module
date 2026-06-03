@@ -1,4 +1,4 @@
-//! Gagaku image helpers for fjs.
+//! Gagaku native modules for fjs.
 
 use std::io::Write;
 
@@ -15,9 +15,9 @@ const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const PNG_DATA_URL_PREFIX: &str = "data:image/png;base64,";
 
 #[linkme::distributed_slice(fjs_native_extensions::NATIVE_EXTENSIONS)]
-static GAGAKU_NATIVE_IMAGE_EXTENSION: NativeExtensionFactory = extension;
+static GAGAKU_NATIVE_MODULE_EXTENSION: NativeExtensionFactory = extension;
 
-/// Returns the native extension registration for Gagaku image helpers.
+/// Returns the native extension registration for Gagaku native modules.
 pub fn extension() -> NativeExtension {
     NativeExtension::new().with_global(init)
 }

@@ -308,7 +308,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gagaku_fjs_native_image"
+name = "gagaku_fjs_native_module"
 version = "0.1.0"
 dependencies = [
  "anyhow",
