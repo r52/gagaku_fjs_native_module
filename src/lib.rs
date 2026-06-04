@@ -1,18 +1,25 @@
 //! Gagaku native modules for fjs.
 
-use std::io::Write;
+mod canvas;
+mod context2d;
+mod data_url;
+mod image;
+mod image_data;
+mod logging;
+mod png;
+mod typed_array;
 
-use anyhow::{Context as _, bail};
-use base64_simd::STANDARD;
-use crc32fast::Hasher;
-use fjs_native_extensions::rquickjs::{
-    ArrayBuffer, Ctx, Exception, Function, Object, Result, TypedArray, Value,
-};
+use canvas::NativeCanvas;
+use context2d::NativeCanvasRenderingContext2D;
 use fjs_native_extensions::{NativeExtension, NativeExtensionFactory};
-use flate2::{Compression, write::ZlibEncoder};
+use image::NativeImage;
+use image_data::{NativeImageData, inspect_image_data};
+use logging::{log_image_error, profile_image_operation};
+use rquickjs::{Class, Ctx, Exception, Function, Object, Result, Value};
+use std::time::Instant;
+use typed_array::with_value_bytes;
 
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-const PNG_DATA_URL_PREFIX: &str = "data:image/png;base64,";
+pub use png::encode_png_data_url_from_rgba;
 
 #[linkme::distributed_slice(fjs_native_extensions::NATIVE_EXTENSIONS)]
 static GAGAKU_NATIVE_MODULE_EXTENSION: NativeExtensionFactory = extension;
@@ -24,6 +31,11 @@ pub fn extension() -> NativeExtension {
 
 fn init(ctx: &Ctx<'_>) -> Result<()> {
     let globals = ctx.globals();
+    Class::<NativeImageData>::define(&globals)?;
+    Class::<NativeImage>::define(&globals)?;
+    Class::<NativeCanvas>::define(&globals)?;
+    Class::<NativeCanvasRenderingContext2D>::define(&globals)?;
+
     let gagaku = match globals.get::<_, Value<'_>>("gagaku") {
         Ok(value) => {
             if let Some(object) = value.as_object() {
@@ -44,9 +56,14 @@ fn init(ctx: &Ctx<'_>) -> Result<()> {
     let native_image = Object::new(ctx.clone())?;
     let encode_png_data_url =
         Function::new(ctx.clone(), encode_png_data_url)?.with_name("encodePngDataUrl")?;
+    let native_canvas = Object::new(ctx.clone())?;
+    let inspect_image_data =
+        Function::new(ctx.clone(), inspect_image_data)?.with_name("inspectImageData")?;
 
     native_image.set("encodePngDataUrl", encode_png_data_url)?;
+    native_canvas.set("inspectImageData", inspect_image_data)?;
     gagaku.set("nativeImage", native_image)?;
+    gagaku.set("nativeCanvas", native_canvas)?;
 
     Ok(())
 }
@@ -57,127 +74,40 @@ fn encode_png_data_url<'js>(
     width: u32,
     height: u32,
 ) -> Result<String> {
-    if let Ok(typed_array) = TypedArray::<u8>::from_value(rgba.clone()) {
-        let rgba = typed_array
-            .as_bytes()
-            .ok_or_else(|| Exception::throw_message(&ctx, "RGBA buffer is detached"))?;
-        return encode_png_data_url_from_rgba(rgba, width, height)
-            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()));
+    let started_at = Instant::now();
+    let mut rgba_len = 0;
+    let result = with_value_bytes(&ctx, rgba, |rgba| {
+        rgba_len = rgba.len();
+        encode_png_data_url_from_rgba(rgba, width, height)
+            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
+    });
+
+    match &result {
+        Ok(data_url) => profile_image_operation(
+            &ctx,
+            "nativeImage.encodePngDataUrl",
+            started_at,
+            format!(
+                "{width}x{height} {rgba_len} rgba bytes {} chars",
+                data_url.len()
+            ),
+        ),
+        Err(err) => log_image_error(
+            &ctx,
+            "nativeImage.encodePngDataUrl",
+            started_at,
+            format!("{width}x{height} {rgba_len} rgba bytes {err}"),
+        ),
     }
 
-    if let Some(object) = rgba.as_object() {
-        if let Some(buffer) = ArrayBuffer::from_object(object.clone()) {
-            let rgba = buffer
-                .as_bytes()
-                .ok_or_else(|| Exception::throw_message(&ctx, "RGBA buffer is detached"))?;
-            return encode_png_data_url_from_rgba(rgba, width, height)
-                .map_err(|err| Exception::throw_message(&ctx, &err.to_string()));
-        }
-
-        let buffer: ArrayBuffer<'js> = object.get("buffer").map_err(|_| {
-            Exception::throw_type(&ctx, "RGBA data must be a Uint8Array or Uint8ClampedArray")
-        })?;
-        let byte_offset: usize = object.get("byteOffset")?;
-        let byte_length: usize = object.get("byteLength")?;
-        let bytes = buffer
-            .as_bytes()
-            .ok_or_else(|| Exception::throw_message(&ctx, "RGBA buffer is detached"))?;
-        let end = byte_offset
-            .checked_add(byte_length)
-            .ok_or_else(|| Exception::throw_range(&ctx, "RGBA byte range overflow"))?;
-        let rgba = bytes
-            .get(byte_offset..end)
-            .ok_or_else(|| Exception::throw_range(&ctx, "RGBA byte range is out of bounds"))?;
-
-        return encode_png_data_url_from_rgba(rgba, width, height)
-            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()));
-    }
-
-    Err(Exception::throw_type(
-        &ctx,
-        "RGBA data must be a Uint8Array or Uint8ClampedArray",
-    ))
-}
-
-/// Encodes RGBA pixels into a PNG data URL.
-pub fn encode_png_data_url_from_rgba(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) -> anyhow::Result<String> {
-    let png = encode_png_from_rgba(rgba, width, height)?;
-    let mut data_url =
-        String::with_capacity(PNG_DATA_URL_PREFIX.len() + STANDARD.encoded_length(png.len()));
-
-    data_url.push_str(PNG_DATA_URL_PREFIX);
-    STANDARD.encode_append(png, &mut data_url);
-
-    Ok(data_url)
-}
-
-fn encode_png_from_rgba(rgba: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
-    if width == 0 || height == 0 {
-        bail!("PNG width and height must be greater than zero");
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let row_len = width
-        .checked_mul(4)
-        .context("PNG row byte length overflow")?;
-    let expected_len = row_len
-        .checked_mul(height)
-        .context("PNG RGBA byte length overflow")?;
-
-    if rgba.len() != expected_len {
-        bail!(
-            "RGBA byte length mismatch: expected {}, got {}",
-            expected_len,
-            rgba.len()
-        );
-    }
-
-    let mut zlib = ZlibEncoder::new(
-        Vec::with_capacity(expected_len + height),
-        Compression::none(),
-    );
-    for row in rgba.chunks_exact(row_len) {
-        zlib.write_all(&[0])?;
-        zlib.write_all(row)?;
-    }
-    let idat = zlib.finish()?;
-
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-
-    let mut png = Vec::with_capacity(PNG_SIGNATURE.len() + 12 + ihdr.len() + 12 + idat.len() + 12);
-    png.extend_from_slice(PNG_SIGNATURE);
-    write_chunk(&mut png, b"IHDR", &ihdr)?;
-    write_chunk(&mut png, b"IDAT", &idat)?;
-    write_chunk(&mut png, b"IEND", &[])?;
-
-    Ok(png)
-}
-
-fn write_chunk(png: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) -> anyhow::Result<()> {
-    let data_len = u32::try_from(data.len()).context("PNG chunk is too large")?;
-    png.extend_from_slice(&data_len.to_be_bytes());
-    png.extend_from_slice(chunk_type);
-    png.extend_from_slice(data);
-
-    let mut hasher = Hasher::new();
-    hasher.update(chunk_type);
-    hasher.update(data);
-    png.extend_from_slice(&hasher.finalize().to_be_bytes());
-
-    Ok(())
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use png::PNG_DATA_URL_PREFIX;
+    use rquickjs::{Context, Runtime};
 
     #[test]
     fn encodes_rgba_to_png_data_url() {
@@ -192,5 +122,105 @@ mod tests {
         let err = encode_png_data_url_from_rgba(&[255, 0, 0], 1, 1).unwrap_err();
 
         assert!(err.to_string().contains("RGBA byte length mismatch"));
+    }
+
+    #[test]
+    fn native_image_data_allocates_uint8_clamped_array() {
+        with_context(|ctx| {
+            let result: String = ctx
+                .eval(
+                    r#"
+                    JSON.stringify((() => {
+                      const imageData = new ImageData(2, 3);
+                      return [
+                        imageData.width,
+                        imageData.height,
+                        imageData.data.length,
+                        imageData.colorSpace,
+                        imageData.data instanceof Uint8ClampedArray
+                      ];
+                    })())
+                    "#,
+                )
+                .unwrap();
+
+            assert_eq!(result, r#"[2,3,24,"srgb",true]"#);
+        });
+    }
+
+    #[test]
+    fn native_image_data_exposes_js_mutations_to_rust() {
+        with_context(|ctx| {
+            let result: String = ctx
+                .eval(
+                    r#"
+                    JSON.stringify((() => {
+                      const imageData = new ImageData(new Uint8ClampedArray(8), 1);
+                      imageData.data[0] = 5;
+                      imageData.data[1] = 260;
+                      imageData.data[2] = -20;
+                      imageData.data[3] = 7;
+                      const probe = gagaku.nativeCanvas.inspectImageData(imageData);
+                      return [
+                        probe.width,
+                        probe.height,
+                        probe.length,
+                        probe.checksum,
+                        probe.first,
+                        probe.second,
+                        probe.third,
+                        probe.fourth
+                      ];
+                    })())
+                    "#,
+                )
+                .unwrap();
+
+            assert_eq!(result, "[1,2,8,267,5,255,0,7]");
+        });
+    }
+
+    #[test]
+    fn native_canvas_draws_and_round_trips_png_data_url() {
+        with_context(|ctx| {
+            let result: String = ctx
+                .eval(
+                    r#"
+                    JSON.stringify((() => {
+                      const image = new Image();
+                      let loaded = false;
+                      image.onload = () => { loaded = true; };
+                      image.src = "data:image/bmp;base64,Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AA==";
+                      const canvas = new HTMLCanvasElement();
+                      canvas.width = 1;
+                      canvas.height = 1;
+                      const context = canvas.getContext("2d");
+                      context.drawImage(image, 0, 0);
+                      const pixels = Array.from(context.getImageData(0, 0, 1, 1).data);
+                      const dataUrl = canvas.toDataURL();
+                      return [
+                        loaded,
+                        image.complete,
+                        image.naturalWidth,
+                        image.naturalHeight,
+                        pixels,
+                        dataUrl.startsWith("data:image/png;base64,")
+                      ];
+                    })())
+                    "#,
+                )
+                .unwrap();
+
+            assert_eq!(result, "[true,true,1,1,[255,0,0,255],true]");
+        });
+    }
+
+    fn with_context(callback: impl FnOnce(rquickjs::Ctx<'_>)) {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            init(&ctx).unwrap();
+            callback(ctx);
+        });
     }
 }
